@@ -1,7 +1,19 @@
+"""
+Olly v3: sommelier de aceite de oliva de Olear.
+
+- Responde con Gemini (Interactions API sin estado, store=False).
+- Guarda la conversación de cada usuario en SQLite (db.py) y la envía como
+  contexto en cada consulta, así recuerda lo hablado aunque se reinicie.
+- /olvidar borra la conversación del usuario.
+"""
+
 import logging
 import os
+
 from dotenv import load_dotenv
+from google import genai
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -10,70 +22,160 @@ from telegram.ext import (
     filters,
 )
 
+import db
+from prompts import PROMPT_SISTEMA
+
+# ---------------------------------------------------------------------------
+# Configuración
+# ---------------------------------------------------------------------------
 load_dotenv()
 
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# El modelo se lee del .env para poder cambiarlo sin tocar el código.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+# Mensajes anteriores que se envían al modelo (20 = 10 preguntas y respuestas).
+MAX_MENSAJES_HISTORIAL = 20
+
+# Longitud máxima de un mensaje de Telegram.
+LIMITE_TELEGRAM = 4096
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("olly")
 
+# ---------------------------------------------------------------------------
+# Conexión con Gemini
+# ---------------------------------------------------------------------------
+cliente_gemini = genai.Client(api_key=GEMINI_API_KEY)
 
+
+def armar_entrada(historial: list[tuple[str, str]], mensaje_nuevo: str) -> list[dict]:
+    """Convierte el historial en los pasos que espera la Interactions API."""
+    tipo_de_paso = {"user": "user_input", "model": "model_output"}
+    pasos = [
+        {"type": tipo_de_paso[rol], "content": [{"type": "text", "text": texto}]}
+        for rol, texto in historial
+    ]
+    pasos.append({"type": "user_input", "content": [{"type": "text", "text": mensaje_nuevo}]})
+    return pasos
+
+
+async def consultar_gemini(historial: list[tuple[str, str]], mensaje: str) -> str:
+    """Envía a Gemini la conversación completa y devuelve el texto de la respuesta."""
+    interaccion = await cliente_gemini.aio.interactions.create(
+        model=GEMINI_MODEL,
+        system_instruction=PROMPT_SISTEMA,
+        input=armar_entrada(historial, mensaje),
+        store=False,  # la memoria la administra el bot, no Google
+    )
+    return interaccion.output_text or "No se me ocurrió nada para responder 🤔"
+
+
+def describir_error(error: Exception) -> str:
+    """Traduce un error de la API a un mensaje comprensible para el usuario."""
+    codigo = getattr(error, "status_code", None)
+    if codigo == 429:
+        return "Estoy recibiendo demasiadas consultas. Probá de nuevo en un minuto, por favor. ⏳"
+    if codigo in (401, 403):
+        return "Tengo un problema de configuración. Avisale a quien me administra. 🔧"
+    return "Tuve un problema para pensar la respuesta. ¿Me lo preguntás de nuevo? 🙏"
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Responde al comando /start
+    """Responde al comando /start."""
     nombre = update.effective_user.first_name
     logger.info("Nuevo /start de %s (id %s)", nombre, update.effective_user.id)
     await update.message.reply_text(
-        f"¡Hola, {nombre}! Soy Olly, tu asistente Sommelier de Olear."
+        f"¡Hola, {nombre}! Soy Olly 🫒, el sommelier de aceite de oliva de Olear.\n\n"
+        "Contame qué vas a cocinar o qué aceite te gusta y te ayudo a elegir "
+        "el ideal: variedades, maridajes, usos en la cocina y más.\n\n"
+        "Escribí /help para ver lo que sé hacer."
     )
 
 
-# Comando /help
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Responder al comando /help
+    """Responde al comando /help."""
     await update.message.reply_text(
         "Estos son mis comandos:\n\n"
         "/start - Presentación de Olly\n"
-        "/help - Esta ayuda\n\n"
-        "Tambien podes escribirme cualquier mensaje y te lo repito."
+        "/help - Esta ayuda\n"
+        "/olvidar - Borra nuestra conversación y empezamos de cero\n\n"
+        "Y, sobre todo, podés escribirme lo que quieras saber sobre "
+        "aceite de oliva. Me acuerdo de lo que hablamos."
     )
 
 
-# Responder un texto (funcion eco)
-async def eco(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Repite cualquier mensaje de texto que no sea un comando
+async def olvidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde al comando /olvidar: borra el historial del usuario."""
+    borrados = await db.borrar_historial(update.effective_user.id)
+    logger.info("Usuario %s borró %d mensajes", update.effective_user.id, borrados)
+    await update.message.reply_text("Listo, empezamos de cero. ¿En qué te ayudo? 🙂")
+
+
+async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde con Gemini, teniendo en cuenta la conversación previa."""
+    user_id = update.effective_user.id
     texto = update.message.text
-    logger.info("Mensaje recibido: %s", texto)
-    await update.message.reply_text(f"Me dijiste {texto}")
+    logger.info("Mensaje de %s: %s", user_id, texto)
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    # Paso 1: recuperar lo que ya se habló con este usuario.
+    historial = await db.obtener_historial(user_id, MAX_MENSAJES_HISTORIAL)
+
+    # Paso 2: consultar al modelo con el historial más el mensaje nuevo.
+    try:
+        respuesta = await consultar_gemini(historial, texto)
+    except Exception as error:
+        logger.error("Error al consultar a Gemini: %s", error)
+        await update.message.reply_text(describir_error(error))
+        return  # si falla, no se guarda nada
+
+    # Paso 3: guardar la pregunta y la respuesta para la próxima consulta.
+    await db.guardar_intercambio(user_id, texto, respuesta)
+
+    for inicio in range(0, len(respuesta), LIMITE_TELEGRAM):
+        await update.message.reply_text(respuesta[inicio:inicio + LIMITE_TELEGRAM])
 
 
-# Manejo de errores
-async def manejo_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Registra cualquier error para que el bot no se detenga en silencio.
+async def manejo_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Registra cualquier error no previsto para que el bot no falle en silencio."""
     logger.error("Error al procesar una actualización", exc_info=context.error)
+
+# ---------------------------------------------------------------------------
+# Arranque
+# ---------------------------------------------------------------------------
+async def al_iniciar(app: Application) -> None:
+    """Se ejecuta una vez, antes de recibir mensajes: prepara la base."""
+    await db.inicializar()
+    logger.info("Base de datos lista (%s).", db.RUTA_DB)
 
 
 def main() -> None:
-    if not TELEGRAM_TOKEN:
-        raise SystemExit(
-            "Falta TELEGRAM_TOKEN."
-        )
-    #logger.info("Token cargado: %s...", TELEGRAM_TOKEN[:12])
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    faltantes = [nombre for nombre, valor in [("TELEGRAM_TOKEN", TELEGRAM_TOKEN),
+                                              ("GEMINI_API_KEY", GEMINI_API_KEY)]
+                 if not valor]
+    if faltantes:
+        raise SystemExit(f"Faltan variables en el .env: {', '.join(faltantes)}")
+
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(al_iniciar).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", ayuda))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, eco))
+    app.add_handler(CommandHandler("olvidar", olvidar))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     app.add_error_handler(manejo_error)
 
-    logger.info("Olly está en línea. Presiona Ctrl+c para detenerlo.")
-
-    # Polling: el bot le pregunta a TG, una y otra vez, si hay mensajes nuevos
+    logger.info("Olly v3 en línea con el modelo %s.", GEMINI_MODEL)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
-

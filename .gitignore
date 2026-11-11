@@ -1,18 +1,21 @@
-# Python virtual environment
+# Entorno virtual
 .venv/
 env/
 venv/
 ENV/
 
-# Environment variables & secrets
+# Variables de entorno y secretos
 .env
 
-# Byte-compiled / optimized files
+# Base de datos local (memoria del bot)
+*.db
+
+# Archivos compilados de Python
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Distribution / packaging
+# Distribucion / empaquetado
 build/
 dist/
 *.egg-info/
@@ -23,4 +26,3 @@ dist/
 # IDEs
 .vscode/
 .idea/
-
