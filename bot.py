@@ -1,15 +1,15 @@
 """
-Olly v5: sommelier de aceite de oliva de Olear.
+Olly v6: sommelier de aceite de oliva de Olear con módulos avanzados.
 
 - Responde con Gemini (Interactions API sin estado, store=False) y function calling
   para consultar el catálogo de Olear HUB, consultar lotes y generar links de pago
   en Mercado Pago Sandbox (herramientas.py).
-- Analiza consultas gastronómicas con salida estructurada (analisis.py) mediante
-  /preferencias y resume perfiles guardados con /perfiles.
-- Guarda el historial y las preferencias en SQLite (db.py).
-- /olvidar borra la conversación del usuario.
+- Multimodalidad: procesa fotos (platos, botellas, etiquetas) y notas de voz.
+- Flujo guiado (/comprar): arma pedidos paso a paso con botones inline e IA (pedidos.py).
+- Análisis estructurado (/preferencias y /perfiles) y memoria en SQLite (db.py).
 """
 
+import base64
 import json
 import logging
 import os
@@ -30,6 +30,7 @@ from telegram.ext import (
 from analisis import analizar_preferencias
 import db
 from herramientas import DECLARACIONES, ejecutar_funcion
+import pedidos
 from prompts import PROMPT_SISTEMA
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,9 @@ MAX_MENSAJES_HISTORIAL = 20
 # Cantidad máxima de vueltas del ciclo de function calling en un mismo mensaje.
 MAX_VUELTAS_HERRAMIENTAS = 5
 
+# Duración máxima de un mensaje de voz, en segundos (cuida la cuota de tokens).
+DURACION_MAXIMA_VOZ = 60
+
 # Longitud máxima de un mensaje de Telegram.
 LIMITE_TELEGRAM = 4096
 
@@ -64,24 +68,30 @@ logger = logging.getLogger("olly")
 cliente_gemini = genai.Client(api_key=GEMINI_API_KEY)
 
 
-def armar_entrada(historial: list[tuple[str, str]], mensaje_nuevo: str) -> list[dict]:
-    """Convierte el historial en los pasos que espera la Interactions API."""
+def armar_entrada(historial: list[tuple[str, str]], contenido_nuevo: list[dict]) -> list[dict]:
+    """
+    Convierte el historial guardado en pasos de la Interactions API y agrega al
+    final el contenido nuevo del usuario como lista de bloques (texto, imagen o audio).
+    """
     tipo_de_paso = {"user": "user_input", "model": "model_output"}
     pasos = [
         {"type": tipo_de_paso[rol], "content": [{"type": "text", "text": texto}]}
         for rol, texto in historial
     ]
-    pasos.append({"type": "user_input", "content": [{"type": "text", "text": mensaje_nuevo}]})
+    pasos.append({"type": "user_input", "content": contenido_nuevo})
     return pasos
 
 
-async def consultar_gemini(historial: list[tuple[str, str]], mensaje: str) -> str:
+async def consultar_gemini(
+    historial: list[tuple[str, str]],
+    contenido_nuevo: list[dict],
+    registro: list[str] | None = None,
+) -> str:
     """
-    Envía la conversación a Gemini y resuelve el ciclo de function calling:
-    mientras el modelo pida funciones, se ejecutan y se le devuelven los
-    resultados; cuando responde con texto, se devuelve ese texto.
+    Envía la conversación a Gemini y resuelve el ciclo de function calling.
+    Si se pasa una lista en `registro`, anota en ella cada función pedida.
     """
-    entrada = armar_entrada(historial, mensaje)
+    entrada = armar_entrada(historial, contenido_nuevo)
     for _ in range(MAX_VUELTAS_HERRAMIENTAS):
         interaccion = await cliente_gemini.aio.interactions.create(
             model=GEMINI_MODEL,
@@ -100,6 +110,8 @@ async def consultar_gemini(historial: list[tuple[str, str]], mensaje: str) -> st
             entrada.append(paso.model_dump())
 
         for llamada in llamadas:
+            if registro is not None:
+                registro.append(llamada.name)
             resultado = await ejecutar_funcion(llamada.name, llamada.arguments)
             entrada.append({
                 "type": "function_result",
@@ -143,12 +155,13 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Estos son mis comandos:\n\n"
         "/start - Presentación de Olly\n"
         "/help - Esta ayuda\n"
-        "/olvidar - Borra nuestra conversación y empezamos de cero\n"
+        "/comprar - Armá tu pedido paso a paso con botones y fecha de entrega\n"
+        "/cancelar - Cancela un pedido en curso\n"
         "/preferencias <texto> - Analiza tus gustos, ingredientes y perfil de compra\n"
-        "/perfiles - Resumen de los perfiles gastronómicos analizados\n\n"
-        "Y, sobre todo, podés escribirme qué vas a cocinar, consultar precios y "
-        "stock del catálogo de Olear, consultar un código de lote o pedir tu link "
-        "de pago. Me acuerdo de lo que hablamos."
+        "/perfiles - Resumen de los perfiles gastronómicos analizados\n"
+        "/olvidar - Borra nuestra conversación y empezamos de cero\n\n"
+        "También podés escribirme por texto, mandarme una foto (de un plato, "
+        "botella o código de lote) o una nota de voz. Me acuerdo de lo que hablamos."
     )
 
 
@@ -214,30 +227,77 @@ async def perfiles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Responde con Gemini, teniendo en cuenta la conversación previa."""
+async def procesar_mensaje(update: Update, contenido: list[dict], texto_para_historial: str) -> None:
+    """
+    Pasos comunes a cualquier mensaje (texto, foto o voz): recuperar el
+    historial, consultar al modelo, guardar el intercambio y responder.
+    """
     user_id = update.effective_user.id
-    texto = update.message.text
-    logger.info("Mensaje de %s: %s", user_id, texto)
-
     await update.message.chat.send_action(ChatAction.TYPING)
 
     # Paso 1: recuperar lo que ya se habló con este usuario.
     historial = await db.obtener_historial(user_id, MAX_MENSAJES_HISTORIAL)
 
-    # Paso 2: consultar al modelo con el historial más el mensaje nuevo.
+    # Paso 2: consultar al modelo con el historial más el contenido nuevo.
     try:
-        respuesta = await consultar_gemini(historial, texto)
+        respuesta = await consultar_gemini(historial, contenido)
     except Exception as error:
         logger.exception("Error al consultar a Gemini")
         await update.message.reply_text(describir_error(error))
         return  # si falla, no se guarda nada
 
-    # Paso 3: guardar la pregunta y la respuesta para la próxima consulta.
-    await db.guardar_intercambio(user_id, texto, respuesta)
+    # Paso 3: guardar texto o descripción breve del intercambio en SQLite.
+    await db.guardar_intercambio(user_id, texto_para_historial, respuesta)
 
     for inicio in range(0, len(respuesta), LIMITE_TELEGRAM):
         await update.message.reply_text(respuesta[inicio:inicio + LIMITE_TELEGRAM])
+
+
+async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde un mensaje de texto."""
+    texto = update.message.text
+    logger.info("Mensaje de %s: %s", update.effective_user.id, texto)
+    await procesar_mensaje(update, [{"type": "text", "text": texto}], texto)
+
+
+async def responder_foto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde una foto (plato, botella o etiqueta), con o sin leyenda."""
+    foto = update.message.photo[-1]  # la última resolución es la más grande
+    archivo = await foto.get_file()
+    datos = await archivo.download_as_bytearray()
+    leyenda = update.message.caption or "¿Qué me podés contar de esta foto?"
+    logger.info("Foto de %s (%d KB): %s", update.effective_user.id, len(datos) // 1024, leyenda)
+    contenido = [
+        {"type": "text", "text": leyenda},
+        {
+            "type": "image",
+            "data": base64.b64encode(datos).decode("ascii"),
+            "mime_type": "image/jpeg",
+        },
+    ]
+    await procesar_mensaje(update, contenido, f"[El usuario envió una foto] {leyenda}")
+
+
+async def responder_voz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde un mensaje de voz."""
+    voz = update.message.voice
+    if voz.duration > DURACION_MAXIMA_VOZ:
+        await update.message.reply_text(
+            f"Tu audio dura más de {DURACION_MAXIMA_VOZ} segundos. ¿Me mandás uno más corto? 🙏"
+        )
+        return
+    archivo = await voz.get_file()
+    datos = await archivo.download_as_bytearray()
+    logger.info("Voz de %s (%d s)", update.effective_user.id, voz.duration)
+    contenido = [
+        {"type": "text", "text": "El usuario envió este mensaje de voz. Respondé a lo que dice."},
+        {
+            "type": "audio",
+            "data": base64.b64encode(datos).decode("ascii"),
+            "mime_type": "audio/ogg",
+        },
+    ]
+    await procesar_mensaje(update, contenido, "[El usuario envió un mensaje de voz]")
 
 
 async def manejo_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -262,15 +322,23 @@ def main() -> None:
 
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(al_iniciar).build()
 
+    # Datos compartidos por los handlers (ej. pedidos.py sin importar bot.py).
+    app.bot_data["cliente_gemini"] = cliente_gemini
+    app.bot_data["modelo"] = GEMINI_MODEL
+
+    # Orden de handlers: flujo guiado primero, luego comandos, multimodalidad y texto libre.
+    app.add_handler(pedidos.crear_manejador())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", ayuda))
     app.add_handler(CommandHandler("olvidar", olvidar))
     app.add_handler(CommandHandler("preferencias", preferencias))
     app.add_handler(CommandHandler("perfiles", perfiles))
+    app.add_handler(MessageHandler(filters.PHOTO, responder_foto))
+    app.add_handler(MessageHandler(filters.VOICE, responder_voz))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     app.add_error_handler(manejo_error)
 
-    logger.info("Olly v5 en línea con el modelo %s.", GEMINI_MODEL)
+    logger.info("Olly v6 en línea con el modelo %s.", GEMINI_MODEL)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

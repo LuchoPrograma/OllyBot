@@ -39,6 +39,21 @@ CREATE TABLE IF NOT EXISTS preferencias (
     fecha                TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_preferencias_usuario ON preferencias (user_id, id);
+
+-- Pedidos armados mediante el flujo guiado /comprar (v6).
+CREATE TABLE IF NOT EXISTS pedidos (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    producto_id     TEXT    NOT NULL,
+    producto_nombre TEXT    NOT NULL,
+    cantidad        INTEGER NOT NULL,
+    total_ars       INTEGER NOT NULL,
+    fecha_entrega   TEXT    NOT NULL,
+    preferencia_mp  TEXT    NOT NULL,
+    link_pago       TEXT    NOT NULL,
+    creado          TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_pedidos_usuario ON pedidos (user_id, id);
 """
 
 
@@ -154,3 +169,35 @@ async def resumen_preferencias() -> dict:
         "por_intensidad": por_intensidad,
         "por_coccion": por_coccion,
     }
+
+
+async def guardar_pedido(
+    user_id: int,
+    producto_id: str,
+    producto_nombre: str,
+    cantidad: int,
+    total_ars: int,
+    fecha_entrega: str,
+    preferencia_mp: str,
+    link_pago: str,
+) -> int:
+    """Guarda un pedido confirmado con su link de Mercado Pago y devuelve su número."""
+    async with aiosqlite.connect(RUTA_DB) as db:
+        cursor = await db.execute(
+            "INSERT INTO pedidos "
+            "(user_id, producto_id, producto_nombre, cantidad, total_ars, "
+            "fecha_entrega, preferencia_mp, link_pago) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id,
+                producto_id,
+                producto_nombre,
+                cantidad,
+                total_ars,
+                fecha_entrega,
+                preferencia_mp,
+                link_pago,
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid
