@@ -35,6 +35,16 @@ CREATE TABLE IF NOT EXISTS resenas (
     resumen TEXT NOT NULL,                               -- resumen en una oración
     fecha TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP        -- fecha y hora
 );
+
+-- Reservas o compras simuladas (v6 - Flujo guiado).
+CREATE TABLE IF NOT EXISTS reservas (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    excursion  TEXT    NOT NULL,
+    fecha      TEXT    NOT NULL,
+    personas   INTEGER NOT NULL,
+    creada     TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -113,3 +123,14 @@ async def resumen_resenas() -> dict:
         "promedio": promedio,
         "por_sentimiento": por_sentimiento,
     }
+
+
+async def guardar_reserva(user_id: int, excursion: str, fecha: str, personas: int) -> int:
+    """Guarda una reserva confirmada y devuelve su número identificador."""
+    async with aiosqlite.connect(RUTA_DB) as db:
+        cursor = await db.execute(
+            "INSERT INTO reservas (user_id, excursion, fecha, personas) VALUES (?, ?, ?, ?)",
+            (user_id, excursion, fecha, personas),
+        )
+        await db.commit()
+        return cursor.lastrowid

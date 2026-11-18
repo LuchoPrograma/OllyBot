@@ -1,11 +1,12 @@
 """
-Olly v5: sommelier de aceite de oliva de Olear.
+Olly v6: sommelier de aceite de oliva de Olear con Flujo Guiado.
 
 - Responde con Gemini (Interactions API sin estado, store=False).
 - Guarda la conversación de cada usuario en SQLite (db.py) y la envía como
   contexto en cada consulta, así recuerda lo hablado aunque se reinicie.
 - Soporta function calling (v4) para consultar catálogo, maridajes y precios.
 - Soporta análisis estructurado de reseñas (v5) con Pydantic y comandos /resena y /resenas.
+- Soporta flujo guiado paso a paso con /reservar (v6).
 - /olvidar borra la conversación del usuario.
 """
 
@@ -30,6 +31,7 @@ from analisis import analizar_resena
 import db
 from herramientas import DECLARACIONES, ejecutar_funcion
 from prompts import PROMPT_SISTEMA
+import reservas
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -140,7 +142,9 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help - Esta ayuda\n"
         "/olvidar - Borra nuestra conversación y empezamos de cero\n"
         "/resena <texto> - Dejá tu opinión sobre una experiencia\n"
-        "/resenas - Ver el resumen de opiniones recibidas\n\n"
+        "/resenas - Ver el resumen de opiniones recibidas\n"
+        "/reservar - Reservá una experiencia o asesoramiento paso a paso\n"
+        "/cancelar - Cancela un trámite en curso\n\n"
         "Y, sobre todo, podés escribirme lo que quieras saber sobre "
         "aceite de oliva. Me acuerdo de lo que hablamos y puedo consultar catálogos y precios."
     )
@@ -253,6 +257,14 @@ def main() -> None:
 
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(al_iniciar).build()
 
+    # Compartir cliente y modelo en bot_data para evitar importaciones circulares en reservas.py
+    app.bot_data["cliente_gemini"] = cliente_gemini
+    app.bot_data["modelo"] = GEMINI_MODEL
+
+    # ¡IMPORTANTE! El flujo guiado va PRIMERO para capturar los pasos activos del usuario
+    app.add_handler(reservas.crear_manejador())
+
+    # Demás manejadores generales
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", ayuda))
     app.add_handler(CommandHandler("olvidar", olvidar))
@@ -261,7 +273,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     app.add_error_handler(manejo_error)
 
-    logger.info("Olly v5 en línea con el modelo %s.", GEMINI_MODEL)
+    logger.info("Olly v6 con Flujo Guiado en línea con el modelo %s.", GEMINI_MODEL)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
