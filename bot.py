@@ -1,17 +1,21 @@
 """
-Olly v3: sommelier de aceite de oliva de Olear.
+Olly v5: sommelier de aceite de oliva de Olear.
 
 - Responde con Gemini (Interactions API sin estado, store=False).
 - Guarda la conversación de cada usuario en SQLite (db.py) y la envía como
   contexto en cada consulta, así recuerda lo hablado aunque se reinicie.
+- Soporta function calling (v4) para consultar catálogo, maridajes y precios.
+- Soporta análisis estructurado de reseñas (v5) con Pydantic y comandos /resena y /resenas.
 - /olvidar borra la conversación del usuario.
 """
 
+import json
 import logging
 import os
 
 from dotenv import load_dotenv
 from google import genai
+from pydantic import ValidationError
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -22,7 +26,9 @@ from telegram.ext import (
     filters,
 )
 
+from analisis import analizar_resena
 import db
+from herramientas import DECLARACIONES, ejecutar_funcion
 from prompts import PROMPT_SISTEMA
 
 # ---------------------------------------------------------------------------
@@ -37,6 +43,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 # Mensajes anteriores que se envían al modelo (20 = 10 preguntas y respuestas).
 MAX_MENSAJES_HISTORIAL = 20
+
+# Límite máximo de vueltas del ciclo de function calling en un mismo mensaje.
+MAX_VUELTAS_HERRAMIENTAS = 5
 
 # Longitud máxima de un mensaje de Telegram.
 LIMITE_TELEGRAM = 4096
@@ -66,14 +75,37 @@ def armar_entrada(historial: list[tuple[str, str]], mensaje_nuevo: str) -> list[
 
 
 async def consultar_gemini(historial: list[tuple[str, str]], mensaje: str) -> str:
-    """Envía a Gemini la conversación completa y devuelve el texto de la respuesta."""
-    interaccion = await cliente_gemini.aio.interactions.create(
-        model=GEMINI_MODEL,
-        system_instruction=PROMPT_SISTEMA,
-        input=armar_entrada(historial, mensaje),
-        store=False,  # la memoria la administra el bot, no Google
-    )
-    return interaccion.output_text or "No se me ocurrió nada para responder 🤔"
+    """Envía la conversación a Gemini y resuelve el ciclo de function calling."""
+    entrada = armar_entrada(historial, mensaje)
+
+    for vuelta in range(MAX_VUELTAS_HERRAMIENTAS):
+        interaccion = await cliente_gemini.aio.interactions.create(
+            model=GEMINI_MODEL,
+            system_instruction=PROMPT_SISTEMA,
+            input=entrada,
+            tools=DECLARACIONES,
+            store=False,  # la memoria la administra el bot, no Google
+        )
+
+        llamadas = [paso for paso in interaccion.steps if paso.type == "function_call"]
+
+        if not llamadas:
+            return interaccion.output_text or "No se me ocurrió nada para responder 🤔"
+
+        for paso in interaccion.steps:
+            entrada.append(paso.model_dump())
+
+        for llamada in llamadas:
+            resultado = await ejecutar_funcion(llamada.name, llamada.arguments)
+            entrada.append({
+                "type": "function_result",
+                "call_id": llamada.id,
+                "name": llamada.name,
+                "result": [{"type": "text", "text": json.dumps(resultado, ensure_ascii=False)}],
+            })
+
+    logger.warning("Se alcanzó el máximo de %d vueltas de herramientas", MAX_VUELTAS_HERRAMIENTAS)
+    return "No pude completar la consulta con las herramientas. ¿Podés reformular la pregunta? 🔄"
 
 
 def describir_error(error: Exception) -> str:
@@ -106,9 +138,11 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Estos son mis comandos:\n\n"
         "/start - Presentación de Olly\n"
         "/help - Esta ayuda\n"
-        "/olvidar - Borra nuestra conversación y empezamos de cero\n\n"
+        "/olvidar - Borra nuestra conversación y empezamos de cero\n"
+        "/resena <texto> - Dejá tu opinión sobre una experiencia\n"
+        "/resenas - Ver el resumen de opiniones recibidas\n\n"
         "Y, sobre todo, podés escribirme lo que quieras saber sobre "
-        "aceite de oliva. Me acuerdo de lo que hablamos."
+        "aceite de oliva. Me acuerdo de lo que hablamos y puedo consultar catálogos y precios."
     )
 
 
@@ -119,8 +153,60 @@ async def olvidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Listo, empezamos de cero. ¿En qué te ayudo? 🙂")
 
 
+async def resena(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde al comando /resena: analiza la opinión y la guarda estructurada en SQLite."""
+    texto = " ".join(context.args).strip()
+    if not texto:
+        await update.message.reply_text(
+            "Escribí tu opinión después del comando. Por ejemplo:\n"
+            "/resena El varietal Arauco tiene un carácter intenso ideal para mis pastas."
+        )
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    try:
+        analisis = await analizar_resena(cliente_gemini, GEMINI_MODEL, texto)
+    except ValidationError:
+        logger.exception("Análisis de reseña con formato inválido")
+        await update.message.reply_text("No pude analizar tu opinión. ¿Probás escribirla de nuevo?")
+        return
+    except Exception as error:
+        logger.exception("Error al analizar la reseña")
+        await update.message.reply_text(describir_error(error))
+        return
+
+    await db.guardar_resena(update.effective_user.id, texto, analisis)
+
+    emoji = {"positivo": "🟢", "neutral": "🟡", "negativo": "🔴"}[analisis.sentimiento]
+    await update.message.reply_text(
+        f"¡Gracias por tu opinión! {emoji}\n\n"
+        f"Sentimiento: {analisis.sentimiento}\n"
+        f"Puntaje: {'★' * analisis.puntaje} ({analisis.puntaje}/5)\n"
+        f"Aspectos: {', '.join(analisis.aspectos)}\n"
+        f"Resumen: {analisis.resumen}"
+    )
+
+
+async def resenas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde al comando /resenas: muestra el resumen de todas las opiniones recibidas."""
+    datos = await db.resumen_resenas()
+    if datos["cantidad"] == 0:
+        await update.message.reply_text("Todavía no recibí opiniones. Podés dejar la tuya con /resena.")
+        return
+
+    conteo = datos["por_sentimiento"]
+    await update.message.reply_text(
+        f"📊 Resumen de opiniones de Olear HUB:\n\n"
+        f"Opiniones recibidas: {datos['cantidad']}\n"
+        f"Puntaje promedio: {datos['promedio']:.1f}/5\n"
+        f"Positivas: {conteo.get('positivo', 0)}\n"
+        f"Neutrales: {conteo.get('neutral', 0)}\n"
+        f"Negativas: {conteo.get('negativo', 0)}"
+    )
+
+
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Responde con Gemini, teniendo en cuenta la conversación previa."""
+    """Responde con Gemini, teniendo en cuenta la conversación previa y las herramientas."""
     user_id = update.effective_user.id
     texto = update.message.text
     logger.info("Mensaje de %s: %s", user_id, texto)
@@ -130,11 +216,11 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Paso 1: recuperar lo que ya se habló con este usuario.
     historial = await db.obtener_historial(user_id, MAX_MENSAJES_HISTORIAL)
 
-    # Paso 2: consultar al modelo con el historial más el mensaje nuevo.
+    # Paso 2: consultar al modelo con el historial más el mensaje nuevo y herramientas.
     try:
         respuesta = await consultar_gemini(historial, texto)
     except Exception as error:
-        logger.error("Error al consultar a Gemini: %s", error)
+        logger.exception("Error al consultar a Gemini")
         await update.message.reply_text(describir_error(error))
         return  # si falla, no se guarda nada
 
@@ -170,10 +256,12 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", ayuda))
     app.add_handler(CommandHandler("olvidar", olvidar))
+    app.add_handler(CommandHandler("resena", resena))
+    app.add_handler(CommandHandler("resenas", resenas))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     app.add_error_handler(manejo_error)
 
-    logger.info("Olly v3 en línea con el modelo %s.", GEMINI_MODEL)
+    logger.info("Olly v5 en línea con el modelo %s.", GEMINI_MODEL)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
